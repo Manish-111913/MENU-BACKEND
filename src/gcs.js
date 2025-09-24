@@ -30,6 +30,35 @@ function publicUrl(objectPath) {
   return `${base}/${encodeURI(objectPath.replace(/^\//, ''))}`;
 }
 
+// Initialize Storage with proper credentials handling
+function initStorage() {
+  if (!Storage) return null;
+  
+  // For cloud deployment: use credentials from environment variable JSON string
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    try {
+      const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+      return new Storage({
+        projectId: credentials.project_id,
+        keyFilename: undefined,
+        credentials: credentials
+      });
+    } catch (error) {
+      console.error('Error parsing Google credentials JSON:', error);
+      return null;
+    }
+  }
+  
+  // For local development: use credentials file path
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = normalizeCredsPath(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    return new Storage();
+  }
+  
+  // Fallback to default authentication (for Google Cloud Run, etc.)
+  return new Storage();
+}
+
 // Optionally create a signed URL if the bucket/object isn't public
 async function signedUrl(objectPath, options = {}) {
   if (!HAS_GCS) return publicUrl(objectPath);
@@ -37,12 +66,9 @@ async function signedUrl(objectPath, options = {}) {
   // If already a full URL, return it
   if (/^https?:\/\//i.test(objectPath)) return objectPath;
 
-  // Ensure GOOGLE_APPLICATION_CREDENTIALS path is normalized (for Windows with spaces)
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = normalizeCredsPath(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-  }
+  const storage = initStorage();
+  if (!storage) return publicUrl(objectPath);
 
-  const storage = new Storage();
   const bucket = storage.bucket(GCS_BUCKET);
   const file = bucket.file(objectPath.replace(/^\//, ''));
   const [exists] = await file.exists();
