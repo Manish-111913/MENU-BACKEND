@@ -1,0 +1,30 @@
+# Node and logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Runtime
+coverage/
+dist/
+build/
+.tmp/
+.temp/
+
+# Logs
+logs/
+*.log
+
+# Credentials and sensitive files
+*.json
+.credentials/
+*-service-account*.json
+*-credentials*.json
+.env.local
+.env.production
