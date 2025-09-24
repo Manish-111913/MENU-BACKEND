@@ -12,8 +12,13 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 // Middleware
 // Be permissive in development to avoid "Failed to fetch" due to CORS/port mismatches.
 // In production, restrict to explicit origins.
+const additionalOrigins = process.env.ADDITIONAL_ORIGINS 
+  ? process.env.ADDITIONAL_ORIGINS.split(',').map(o => o.trim())
+  : [];
+
 const allowedOrigins = [
   FRONTEND_ORIGIN,
+  ...additionalOrigins,
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'http://localhost:3300',
