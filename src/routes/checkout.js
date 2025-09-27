@@ -155,7 +155,26 @@ router.post('/', async (req, res) => {
 
       // Optional legacy bridge: insert into session_orders if table exists
       try {
-        const soExists = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='session_orders' LIMIT 1`);
+        let soExists = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='session_orders' LIMIT 1`);
+        if (!soExists.rowCount) {
+          // attempt auto-create to ensure backward compatibility
+          try {
+            await client.query(`CREATE TABLE session_orders (
+              id BIGSERIAL PRIMARY KEY,
+              session_id BIGINT UNIQUE NOT NULL,
+              order_status TEXT,
+              payment_status TEXT,
+              total_amount NUMERIC(12,2) DEFAULT 0,
+              created_at TIMESTAMPTZ DEFAULT NOW()
+            )`);
+            log('session-orders-created');
+            debug.push({ step:'session-orders-created' });
+            soExists = { rowCount:1 };
+          } catch (createErr) {
+            log('session-orders-create-failed', { error: createErr.message });
+            debug.push({ step:'session-orders-create-failed', error: createErr.message });
+          }
+        }
         if (soExists.rowCount) {
           // Insert only if no existing row for this session
             const existing = await client.query(`SELECT id FROM session_orders WHERE session_id=$1 LIMIT 1`, [sessionId]);
