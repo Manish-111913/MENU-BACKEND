@@ -10,18 +10,22 @@ const { pool, withTenant } = require('../db');
 //  - If payFirst flag passed, immediately mark order payment_status='paid'
 router.post('/', async (req, res) => {
   const debug = [];
+  const textLog = [];
+  const log = (msg, extra) => { const line = extra ? { msg, ...extra } : { msg }; debug.push({ step:'log', ...line }); textLog.push(line); };
   const start = Date.now();
   const { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes = 15, payFirst = false, payNow = false, items = [] } = req.body || {};
   const effectivePayFirst = !!(payFirst || payNow); // accept both flags
   debug.push({ step:'version', value:'checkout-v2-dynamic' });
+  log('incoming-payload', { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes, flags:{ payFirst, payNow, effectivePayFirst }, itemCount: items.length });
   try {
     if (!pool) {
-      return res.json({ success: true, orderId: 'mock-1', sessionId: 'mock-session', paymentStatus: effectivePayFirst ? 'paid':'unpaid', amount: items.reduce((s,i)=>s + (i.price||0)*(i.quantity||0),0), debug:['mock-env'] });
+      log('pool-missing-mock-env');
+      return res.json({ success: true, orderId: 'mock-1', sessionId: 'mock-session', paymentStatus: effectivePayFirst ? 'paid':'unpaid', amount: items.reduce((s,i)=>s + (i.price||0)*(i.quantity||0),0), debug, textLog });
     }
     const client = await pool.connect();
     try {
       const tenantId = Number(businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
-      if (!tenantId) return res.status(400).json({ error:'businessId required' });
+  if (!tenantId) { log('missing-businessId'); return res.status(400).json({ error:'businessId required', debug, textLog }); }
       debug.push({ step:'tenant', tenantId });
       await withTenant(client, tenantId);
 
@@ -44,9 +48,10 @@ router.post('/', async (req, res) => {
           orders: resolveTable(['Orders','orders']),
           orderitems: resolveTable(['OrderItems','orderitems','order_items'])
         };
-        debug.push({ step:'resolved-tables', resolved });
+        debug.push({ step:'resolved-tables', resolved }); log('resolved-tables', resolved);
         if (!resolved.qrcodes || !resolved.diningsessions || !resolved.orders) {
           debug.push({ step:'missing-core-table', missing: Object.entries(resolved).filter(([k,v])=>!v).map(([k])=>k) });
+          log('missing-core-table', { missing: Object.entries(resolved).filter(([k,v])=>!v).map(([k])=>k) });
         }
         const qi = n => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
         client._resolvedTables = { raw: resolved, qi };
@@ -72,17 +77,17 @@ router.post('/', async (req, res) => {
               const qrName = client._resolvedTables?.raw?.qrcodes || 'QRCodes';
               const sel = await client.query(`SELECT qr_code_id, current_session_id FROM ${client._resolvedTables? client._resolvedTables.qi(qrName):'QRCodes'} WHERE business_id=$1 AND table_number=$2 LIMIT 1`, [tenantId, normTable]);
               if (sel.rowCount) {
-                qrCodeId = sel.rows[0].qr_code_id; debug.push({ step:'qr-found', qrCodeId });
+                qrCodeId = sel.rows[0].qr_code_id; debug.push({ step:'qr-found', qrCodeId }); log('qr-found', { qrCodeId });
               } else {
                 try {
                   const qrName2 = client._resolvedTables?.raw?.qrcodes || 'QRCodes';
                   const ins = await client.query(`INSERT INTO ${client._resolvedTables? client._resolvedTables.qi(qrName2):'QRCodes'} (business_id, table_number) VALUES ($1,$2) RETURNING qr_code_id, current_session_id`, [tenantId, normTable]);
-                  qrCodeId = ins.rows[0].qr_code_id; debug.push({ step:'qr-inserted', qrCodeId });
+                  qrCodeId = ins.rows[0].qr_code_id; debug.push({ step:'qr-inserted', qrCodeId }); log('qr-inserted', { qrCodeId });
                 } catch (insErr) {
                   if (insErr.code === '23505') { // unique violation race
                     const qrName3 = client._resolvedTables?.raw?.qrcodes || 'QRCodes';
                     const again = await client.query(`SELECT qr_code_id, current_session_id FROM ${client._resolvedTables? client._resolvedTables.qi(qrName3):'QRCodes'} WHERE business_id=$1 AND table_number=$2 LIMIT 1`, [tenantId, normTable]);
-                    if (again.rowCount) { qrCodeId = again.rows[0].qr_code_id; debug.push({ step:'qr-race-recovered', qrCodeId }); }
+                    if (again.rowCount) { qrCodeId = again.rows[0].qr_code_id; debug.push({ step:'qr-race-recovered', qrCodeId }); log('qr-race-recovered', { qrCodeId }); }
                   } else { debug.push({ step:'qr-insert-error', error:insErr.message }); }
                 }
               }
@@ -96,7 +101,7 @@ router.post('/', async (req, res) => {
                 if (currentId) {
                   const dsName2 = client._resolvedTables?.raw?.diningsessions || 'DiningSessions';
                   const act = await client.query(`SELECT session_id FROM ${client._resolvedTables? client._resolvedTables.qi(dsName2):'DiningSessions'} WHERE session_id=$1 AND status='active'`, [currentId]);
-                  if (act.rowCount) { sessionId = act.rows[0].session_id; debug.push({ step:'reuse-linked-session', sessionId }); }
+                  if (act.rowCount) { sessionId = act.rows[0].session_id; debug.push({ step:'reuse-linked-session', sessionId }); log('reuse-linked-session', { sessionId }); }
                 }
               } catch (reErr) { debug.push({ step:'check-linked-session-error', error: reErr.message }); }
             }
@@ -104,7 +109,7 @@ router.post('/', async (req, res) => {
               try {
                 const dsName3 = client._resolvedTables?.raw?.diningsessions || 'DiningSessions';
                 const ds = await client.query(`INSERT INTO ${client._resolvedTables? client._resolvedTables.qi(dsName3):'DiningSessions'} (business_id, qr_code_id, status) VALUES ($1,$2,'active') RETURNING session_id`, [tenantId, qrCodeId]);
-                sessionId = ds.rows[0].session_id; debug.push({ step:'session-created', sessionId });
+                sessionId = ds.rows[0].session_id; debug.push({ step:'session-created', sessionId }); log('session-created', { sessionId });
                 try { const qrName5 = client._resolvedTables?.raw?.qrcodes || 'QRCodes'; await client.query(`UPDATE ${client._resolvedTables? client._resolvedTables.qi(qrName5):'QRCodes'} SET current_session_id=$1 WHERE qr_code_id=$2`, [sessionId, qrCodeId]); } catch(updErr){ debug.push({ step:'link-session-failed', error:updErr.message }); }
               } catch (dsErr) { debug.push({ step:'session-create-error', error: dsErr.message }); }
             }
@@ -117,18 +122,19 @@ router.post('/', async (req, res) => {
             if (!qrCodeIdFallback) {
               const qrName7 = client._resolvedTables?.raw?.qrcodes || 'QRCodes';
               const insAny = await client.query(`INSERT INTO ${client._resolvedTables? client._resolvedTables.qi(qrName7):'QRCodes'} (business_id, table_number) VALUES ($1,'GEN') RETURNING qr_code_id`, [tenantId]);
-              qrCodeIdFallback = insAny.rows[0].qr_code_id; debug.push({ step:'qr-generic-created', qrCodeId: qrCodeIdFallback });
+              qrCodeIdFallback = insAny.rows[0].qr_code_id; debug.push({ step:'qr-generic-created', qrCodeId: qrCodeIdFallback }); log('qr-generic-created', { qrCodeId: qrCodeIdFallback });
             }
             const dsName4 = client._resolvedTables?.raw?.diningsessions || 'DiningSessions';
             const ds = await client.query(`INSERT INTO ${client._resolvedTables? client._resolvedTables.qi(dsName4):'DiningSessions'} (business_id, qr_code_id, status) VALUES ($1,$2,'active') RETURNING session_id`, [tenantId, qrCodeIdFallback]);
-            sessionId = ds.rows[0].session_id; debug.push({ step:'session-created-generic', sessionId });
+            sessionId = ds.rows[0].session_id; debug.push({ step:'session-created-generic', sessionId }); log('session-created-generic', { sessionId });
             try { const qrName8 = client._resolvedTables?.raw?.qrcodes || 'QRCodes'; await client.query(`UPDATE ${client._resolvedTables? client._resolvedTables.qi(qrName8):'QRCodes'} SET current_session_id=$1 WHERE qr_code_id=$2`, [sessionId, qrCodeIdFallback]); } catch(_l){}
           } catch(genErr) { debug.push({ step:'generic-session-error', error: genErr.message }); }
         }
       }
 
       if (!sessionId) {
-        return res.status(500).json({ error:'Failed to ensure session', debug });
+        log('ensure-session-failed');
+        return res.status(500).json({ error:'Failed to ensure session', debug, textLog });
       }
 
       // Create order
@@ -140,11 +146,35 @@ router.post('/', async (req, res) => {
            VALUES ($1,$2,'PLACED',$3,$4) RETURNING order_id, payment_status`,
           [tenantId, sessionId, customerPrepTimeMinutes, orderPaymentStatus]
         );
-        orderId = ord.rows[0].order_id; orderPaymentStatus = ord.rows[0].payment_status; debug.push({ step:'order-created', orderId });
+        orderId = ord.rows[0].order_id; orderPaymentStatus = ord.rows[0].payment_status; debug.push({ step:'order-created', orderId }); log('order-created', { orderId });
       } catch(orderErr) {
         debug.push({ step:'order-create-error', error: orderErr.message, code: orderErr.code, detail: orderErr.detail });
-        return res.status(500).json({ error:'Failed to create order', debug });
+        log('order-create-error', { message: orderErr.message, code: orderErr.code, detail: orderErr.detail });
+        return res.status(500).json({ error:'Failed to create order', debug, textLog });
       }
+
+      // Optional legacy bridge: insert into session_orders if table exists
+      try {
+        const soExists = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='session_orders' LIMIT 1`);
+        if (soExists.rowCount) {
+          // Insert only if no existing row for this session
+            const existing = await client.query(`SELECT id FROM session_orders WHERE session_id=$1 LIMIT 1`, [sessionId]);
+            if (!existing.rowCount) {
+              const totalAmount = items.reduce((s,i)=> s + ( (i.price||0) * (i.quantity||0) ), 0);
+              try {
+                await client.query(`INSERT INTO session_orders (session_id, order_status, payment_status, total_amount, created_at) VALUES ($1,'completed',$2,$3,NOW())`, [sessionId, orderPaymentStatus, totalAmount]);
+                log('session-orders-inserted', { sessionId, totalAmount });
+                debug.push({ step:'session-orders-inserted', sessionId, totalAmount });
+              } catch (bridgeErr) {
+                log('session-orders-insert-error', { message: bridgeErr.message, code: bridgeErr.code });
+                debug.push({ step:'session-orders-insert-error', error: bridgeErr.message, code: bridgeErr.code });
+              }
+            } else {
+              log('session-orders-existing', { sessionId });
+              debug.push({ step:'session-orders-existing', sessionId });
+            }
+        } else { log('session-orders-missing'); }
+      } catch (soOuter) { log('session-orders-bridge-check-error', { error: soOuter.message }); }
 
       // Insert order items (only if menuItemId present) - tolerate failures
       for (const it of items) {
@@ -156,8 +186,10 @@ router.post('/', async (req, res) => {
                VALUES ($1,$2,'QUEUED',$3)`,
               [orderId, it.menuItemId, tenantId]
             );
+            log('item-inserted', { menuItemId: it.menuItemId });
           } catch(itemErr) {
             debug.push({ step:'item-insert-error', menuItemId: it.menuItemId, error:itemErr.message, code:itemErr.code });
+            log('item-insert-error', { menuItemId: it.menuItemId, error:itemErr.message, code:itemErr.code });
           }
         }
       }
@@ -167,17 +199,18 @@ router.post('/', async (req, res) => {
         try {
           await client.query(`UPDATE Orders SET payment_status='paid' WHERE order_id=$1`, [orderId]);
           orderPaymentStatus='paid'; debug.push({ step:'order-marked-paid' });
-  } catch(payErr) { debug.push({ step:'mark-paid-error', error: payErr.message, code: payErr.code }); }
+          log('order-marked-paid', { orderId });
+        } catch(payErr) { debug.push({ step:'mark-paid-error', error: payErr.message, code: payErr.code }); log('mark-paid-error', { message: payErr.message, code: payErr.code }); }
       }
 
-      res.json({ success: true, orderId, sessionId, paymentStatus: orderPaymentStatus, debug, elapsedMs: Date.now()-start });
+      res.json({ success: true, orderId, sessionId, paymentStatus: orderPaymentStatus, debug, textLog, elapsedMs: Date.now()-start });
     } finally {
       client.release();
     }
   } catch (err) {
     console.error('POST /api/checkout error:', err);
     debug.push({ step:'fatal', error: err.message });
-    res.status(500).json({ error: 'Checkout failed', debug });
+    res.status(500).json({ error: 'Checkout failed', debug, textLog });
   }
 });
 

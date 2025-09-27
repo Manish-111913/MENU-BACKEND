@@ -7,6 +7,109 @@ router.get('/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
+// GET /api/diagnostics/order-pipeline?businessId=1
+// Returns existence of core tables + ability to run trivial SELECTs
+router.get('/order-pipeline', async (req, res) => {
+  const debug = [];
+  try {
+    if (!pool) return res.json({ ok: false, error: 'no-pool' });
+    const businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
+    const client = await pool.connect();
+    try {
+      if (businessId) await withTenant(client, businessId);
+      const tbls = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = tbls.rows.map(r => r.table_name.toLowerCase());
+      const need = ['qrcodes', 'diningsessions', 'orders', 'orderitems'];
+      const resolved = {};
+      for (const n of need) {
+        resolved[n] = present.find(p => p === n || p === n.replace(/s$/, 's')) || null;
+      }
+      debug.push({ step: 'tables', resolved });
+      const summary = {};
+      for (const [k, v] of Object.entries(resolved)) summary[k] = !!v;
+      let sampleCounts = {};
+      for (const [k, v] of Object.entries(resolved)) {
+        if (v) {
+          try {
+            const { rows } = await client.query(`SELECT count(*)::int AS c FROM ${v}`);
+            sampleCounts[k] = rows[0].c;
+          } catch (e) { sampleCounts[k] = 'err:' + e.code; }
+        }
+      }
+      res.json({ ok: true, businessId, summary, sampleCounts, debug });
+    } finally { client.release(); }
+  } catch (e) {
+    debug.push({ step: 'fatal', error: e.message });
+    res.status(500).json({ ok: false, error: e.message, debug });
+  }
+});
+
+// List all public tables
+router.get('/tables', async (_req, res) => {
+  try {
+    if (!pool) return res.json({ ok:false, error:'no-pool' });
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name`);
+      res.json({ ok:true, tables: rows.map(r=>r.table_name) });
+    } finally { client.release(); }
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// Describe a table's columns
+router.get('/table/:name', async (req,res) => {
+  try {
+    if (!pool) return res.json({ ok:false, error:'no-pool' });
+    const name = req.params.name;
+    const client = await pool.connect();
+    try {
+      const cols = await client.query(`SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 ORDER BY ordinal_position`, [name]);
+      res.json({ ok:true, table:name, columns: cols.rows });
+    } finally { client.release(); }
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// Trace last N orders with sessions & qrcodes linkage
+router.get('/order-trace', async (req,res) => {
+  const limit = Math.min( Number(req.query.limit)||10, 100);
+  const businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
+  try {
+    if (!pool) return res.json({ ok:false, error:'no-pool' });
+    const client = await pool.connect();
+    try {
+      if (businessId) await withTenant(client, businessId);
+      const sql = `SELECT o.order_id, o.dining_session_id, o.status, o.payment_status, o.placed_at,
+                          ds.qr_code_id, q.table_number
+                   FROM Orders o
+                   LEFT JOIN DiningSessions ds ON ds.session_id = o.dining_session_id
+                   LEFT JOIN QRCodes q ON q.qr_code_id = ds.qr_code_id
+                   ${businessId? 'WHERE o.business_id = $1':''}
+                   ORDER BY o.placed_at DESC LIMIT ${limit}`;
+      const params = businessId? [businessId]:[];
+      const { rows } = await client.query(sql, params);
+      res.json({ ok:true, businessId, count: rows.length, orders: rows });
+    } finally { client.release(); }
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// Show session_orders rows (legacy/modern bridge) if table exists
+router.get('/session-orders', async (req,res) => {
+  const businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
+  try {
+    if (!pool) return res.json({ ok:false, error:'no-pool' });
+    const client = await pool.connect();
+    try {
+      if (businessId) await withTenant(client, businessId);
+      const exists = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='session_orders' LIMIT 1`);
+      if (!exists.rowCount) return res.json({ ok:false, error:'session_orders-missing' });
+      const sql = `SELECT id, session_id, order_status, payment_status, total_amount, created_at FROM session_orders ${businessId? 'WHERE business_id=$1':''} ORDER BY id DESC LIMIT 50`;
+      const params = businessId? [businessId]:[];
+      const { rows } = await client.query(sql, params).catch(e=>({ rows:[], error:e.message }));
+      res.json({ ok:true, businessId, count: rows.length, rows });
+    } finally { client.release(); }
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
 // Returns basic insight about tables & active sessions for a business
 router.get('/table-state', async (req, res) => {
   const businessId = Number(req.query.businessId || req.query.bid || req.query.b) || null;
