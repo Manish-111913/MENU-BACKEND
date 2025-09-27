@@ -33,6 +33,26 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Global concise logger for troubleshooting 500s on checkout
+app.use(async (req, res, next) => {
+  const start = Date.now();
+  const tag = `${req.method} ${req.originalUrl}`;
+  res.on('finish', () => {
+    if (tag.includes('/api/checkout') || tag.includes('/api/diagnostics') ) {
+      console.log(`[TRACE] ${tag} -> ${res.statusCode} ${Date.now()-start}ms`);
+    }
+  });
+  next();
+});
+
+// Temporary debug request logger (can remove after diagnosing)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/qr/') || req.path.startsWith('/api/qr') ) {
+    console.log(`[REQ] ${new Date().toISOString()} ${req.method} ${req.originalUrl} ip=${req.ip}`);
+  }
+  next();
+});
+
 // Health
 app.get('/health', (_, res) => res.json({ ok: true }));
 
@@ -40,7 +60,20 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 app.use('/api/menu', require('./routes/menu'));
 app.use('/api/checkout', require('./routes/checkout'));
 app.use('/api/orders', require('./routes/orders'));
+app.use('/api/orders', require('./routes/orders_admin'));
 app.use('/api/smoke', require('./routes/smoke'));
+app.use('/api/sessions', require('./routes/sessions'));
+app.use('/api/diagnostics', require('./routes/diagnostics'));
+
+// QR routes (diagnostics & ensure-session)
+try {
+  const { router: qrRouter, attachScanRoute } = require('./routes/qr');
+  app.use('/api/qr', qrRouter);
+  attachScanRoute(app); // mounts /qr/:qrId
+  console.log('QR scan & helper routes registered');
+} catch (e) {
+  console.error('Failed to register QR routes', e);
+}
 
 // Fallback
 app.use((req, res) => {
