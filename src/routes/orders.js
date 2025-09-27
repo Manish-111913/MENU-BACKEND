@@ -355,3 +355,37 @@ router.get('/by-table', async (req, res) => {
     res.status(500).json({ error: 'Failed to aggregate by table' });
   }
 });
+
+// GET /api/orders/debug-latest?businessId=1&limit=20
+// Returns the most recent orders with resolved table numbers & session payment status for quick validation.
+router.get('/debug-latest', async (req,res)=>{
+  try {
+    if (!pool) return res.status(503).json({ error:'DB unavailable'});
+    const businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
+    if (!businessId) return res.status(400).json({ error:'businessId required'});
+    const limit = Math.min(Number(req.query.limit)||20, 100);
+    const client = await pool.connect();
+    try {
+      await withTenant(client, businessId);
+      // Detect if total_amount column exists in Orders; some schemas may not yet have it.
+      const colCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='total_amount' LIMIT 1`);
+      const totalExpr = colCheck.rowCount ? 'o.total_amount' : '0::numeric AS total_amount';
+      // Detect if DiningSessions has payment_status column (older schemas may not).
+      const dsPayCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name='diningsessions' AND column_name='payment_status' LIMIT 1`);
+      const sessionPayExpr = dsPayCheck.rowCount ? 'ds.payment_status AS session_payment_status' : 'NULL::text AS session_payment_status';
+      const sql = `SELECT o.order_id, o.dining_session_id, o.status, o.payment_status, ${totalExpr}, o.placed_at,
+                          ${sessionPayExpr}, q.table_number
+                     FROM Orders o
+                     LEFT JOIN DiningSessions ds ON ds.session_id = o.dining_session_id
+                     LEFT JOIN QRCodes q ON q.qr_code_id = ds.qr_code_id
+                    WHERE o.business_id = $1
+                    ORDER BY o.placed_at DESC
+                    LIMIT ${limit}`;
+      const { rows } = await client.query(sql,[businessId]);
+      res.json({ businessId, count: rows.length, orders: rows });
+    } finally { client.release(); }
+  } catch(e){
+    console.error('GET /api/orders/debug-latest error', e);
+    res.status(500).json({ error:'failed-debug-latest', message: e.message });
+  }
+});
