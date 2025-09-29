@@ -189,6 +189,17 @@ router.post('/', async (req, res) => {
                 debug.push({ step:'session-orders-insert-error', error: bridgeErr.message, code: bridgeErr.code });
               }
             } else {
+              // Update existing record to paid if payFirst was requested
+              if (effectivePayFirst) {
+                try {
+                  await client.query(`UPDATE session_orders SET payment_status='paid' WHERE session_id=$1`, [sessionId]);
+                  log('session-orders-updated-paid', { sessionId });
+                  debug.push({ step:'session-orders-updated-paid', sessionId });
+                } catch (updateErr) {
+                  log('session-orders-update-error', { message: updateErr.message });
+                  debug.push({ step:'session-orders-update-error', error: updateErr.message });
+                }
+              }
               log('session-orders-existing', { sessionId });
               debug.push({ step:'session-orders-existing', sessionId });
             }

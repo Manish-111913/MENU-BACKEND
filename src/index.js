@@ -64,6 +64,7 @@ app.use('/api/orders', require('./routes/orders_admin'));
 app.use('/api/smoke', require('./routes/smoke'));
 app.use('/api/sessions', require('./routes/sessions'));
 app.use('/api/diagnostics', require('./routes/diagnostics'));
+app.use('/api/mark-paid', require('./routes/markPaid'));
 
 // QR routes (diagnostics & ensure-session)
 try {
