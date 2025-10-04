@@ -101,14 +101,35 @@ router.post('/ensure-session', async (req, res) => {
         if (!qr.rowCount) return res.status(404).json({ error: 'QR code not found' });
         qrRow = qr.rows[0];
       } else {
-        // upsert by table number
-        const qr = await client.query(
-          `INSERT INTO QRCodes (business_id, table_number) VALUES ($1,$2)
-           ON CONFLICT (business_id, table_number) DO UPDATE SET table_number=EXCLUDED.table_number
-           RETURNING qr_code_id, table_number, current_session_id`,
-          [businessId, String(tableNumber).trim()]
+        // ensure by table number without requiring a unique constraint
+        const tbl = String(tableNumber).trim();
+        let sel = await client.query(
+          `SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
+          [businessId, tbl]
         );
-        qrRow = qr.rows[0];
+        if (sel.rowCount) {
+          qrRow = sel.rows[0];
+        } else {
+          try {
+            const ins = await client.query(
+              `INSERT INTO QRCodes (business_id, table_number) VALUES ($1,$2)
+               RETURNING qr_code_id, table_number, current_session_id`,
+              [businessId, tbl]
+            );
+            qrRow = ins.rows[0];
+          } catch (insErr) {
+            // Handle potential duplicate insert races without unique constraint
+            if (insErr && insErr.code === '23505') {
+              const again = await client.query(
+                `SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
+                [businessId, tbl]
+              );
+              if (again.rowCount) qrRow = again.rows[0];
+            } else {
+              throw insErr;
+            }
+          }
+        }
       }
       const result = await ensureActiveSession(client, businessId, qrRow);
       // Try optional last_scan_at update if column exists
