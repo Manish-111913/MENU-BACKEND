@@ -15,12 +15,15 @@ router.post('/', async (req, res) => {
   const start = Date.now();
   const { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes = 15, payFirst = false, payNow = false, items = [] } = req.body || {};
   const effectivePayFirst = !!(payFirst || payNow); // accept both flags
+  // Compute total amount up front for persistence into Orders/session_orders when possible
+  const safeItems = Array.isArray(items) ? items : [];
+  const totalAmount = safeItems.reduce((s,i)=> s + ((Number(i.price)||0) * (Number(i.quantity)||0)), 0);
   debug.push({ step:'version', value:'checkout-v2-dynamic' });
-  log('incoming-payload', { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes, flags:{ payFirst, payNow, effectivePayFirst }, itemCount: items.length });
+  log('incoming-payload', { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes, flags:{ payFirst, payNow, effectivePayFirst }, itemCount: safeItems.length, totalAmount });
   try {
     if (!pool) {
       log('pool-missing-mock-env');
-      return res.json({ success: true, orderId: 'mock-1', sessionId: 'mock-session', paymentStatus: effectivePayFirst ? 'paid':'unpaid', amount: items.reduce((s,i)=>s + (i.price||0)*(i.quantity||0),0), debug, textLog });
+      return res.json({ success: true, orderId: 'mock-1', sessionId: 'mock-session', paymentStatus: effectivePayFirst ? 'paid':'unpaid', amount: totalAmount, debug, textLog });
     }
     const client = await pool.connect();
     try {
@@ -147,6 +150,23 @@ router.post('/', async (req, res) => {
           [tenantId, sessionId, customerPrepTimeMinutes, orderPaymentStatus]
         );
         orderId = ord.rows[0].order_id; orderPaymentStatus = ord.rows[0].payment_status; debug.push({ step:'order-created', orderId }); log('order-created', { orderId });
+        // Persist total amount into Orders.total_amount if the column exists
+        try {
+          const colCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND LOWER(table_name)=LOWER($1) AND column_name='total_amount' LIMIT 1`, [ordersName]);
+          const qn = client._resolvedTables? client._resolvedTables.qi(ordersName):'Orders';
+          if (!colCheck.rowCount) {
+            // Try to add the column automatically (safe no-op if exists because of exception)
+            try { await client.query(`ALTER TABLE ${qn} ADD COLUMN total_amount NUMERIC(12,2) DEFAULT 0`); debug.push({ step:'orders-add-total-amount-column' }); }
+            catch(_e) { /* ignore if cannot add */ }
+          }
+          const colCheck2 = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND LOWER(table_name)=LOWER($1) AND column_name='total_amount' LIMIT 1`, [ordersName]);
+          if (colCheck2.rowCount) {
+            await client.query(`UPDATE ${qn} SET total_amount=$1 WHERE order_id=$2`, [totalAmount, orderId]);
+            debug.push({ step:'orders-total-amount-updated', orderId, totalAmount });
+          } else {
+            debug.push({ step:'orders-total-amount-missing-column' });
+          }
+        } catch (taErr) { debug.push({ step:'orders-total-amount-update-error', error: taErr.message }); }
       } catch(orderErr) {
         debug.push({ step:'order-create-error', error: orderErr.message, code: orderErr.code, detail: orderErr.detail });
         log('order-create-error', { message: orderErr.message, code: orderErr.code, detail: orderErr.detail });
@@ -161,6 +181,7 @@ router.post('/', async (req, res) => {
           try {
             await client.query(`CREATE TABLE session_orders (
               id BIGSERIAL PRIMARY KEY,
+              business_id BIGINT,
               session_id BIGINT UNIQUE NOT NULL,
               order_status TEXT,
               payment_status TEXT,
@@ -176,12 +197,24 @@ router.post('/', async (req, res) => {
           }
         }
         if (soExists.rowCount) {
+          // Ensure business_id column exists; try to add if missing
+          let soHasBiz = false;
+          try {
+            const colChk = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='session_orders' AND column_name='business_id' LIMIT 1`);
+            soHasBiz = !!colChk.rowCount;
+          } catch(_e) {}
+          if (!soHasBiz) {
+            try { await client.query(`ALTER TABLE session_orders ADD COLUMN business_id BIGINT`); soHasBiz = true; debug.push({ step:'session-orders-add-business-id' }); } catch(_e) {}
+          }
           // Insert only if no existing row for this session
             const existing = await client.query(`SELECT id FROM session_orders WHERE session_id=$1 LIMIT 1`, [sessionId]);
             if (!existing.rowCount) {
-              const totalAmount = items.reduce((s,i)=> s + ( (i.price||0) * (i.quantity||0) ), 0);
               try {
-                await client.query(`INSERT INTO session_orders (session_id, order_status, payment_status, total_amount, created_at) VALUES ($1,'completed',$2,$3,NOW())`, [sessionId, orderPaymentStatus, totalAmount]);
+                if (soHasBiz) {
+                  await client.query(`INSERT INTO session_orders (business_id, session_id, order_status, payment_status, total_amount, created_at) VALUES ($1,$2,'completed',$3,$4,NOW())`, [tenantId, sessionId, orderPaymentStatus, totalAmount]);
+                } else {
+                  await client.query(`INSERT INTO session_orders (session_id, order_status, payment_status, total_amount, created_at) VALUES ($1,'completed',$2,$3,NOW())`, [sessionId, orderPaymentStatus, totalAmount]);
+                }
                 log('session-orders-inserted', { sessionId, totalAmount });
                 debug.push({ step:'session-orders-inserted', sessionId, totalAmount });
               } catch (bridgeErr) {
@@ -207,7 +240,7 @@ router.post('/', async (req, res) => {
       } catch (soOuter) { log('session-orders-bridge-check-error', { error: soOuter.message }); }
 
       // Insert order items (only if menuItemId present) - tolerate failures
-      for (const it of items) {
+      for (const it of safeItems) {
         if (it && it.menuItemId) {
           try {
             const itemsName = client._resolvedTables?.raw?.orderitems || 'OrderItems';
@@ -233,7 +266,7 @@ router.post('/', async (req, res) => {
         } catch(payErr) { debug.push({ step:'mark-paid-error', error: payErr.message, code: payErr.code }); log('mark-paid-error', { message: payErr.message, code: payErr.code }); }
       }
 
-      res.json({ success: true, orderId, sessionId, paymentStatus: orderPaymentStatus, debug, textLog, elapsedMs: Date.now()-start });
+      res.json({ success: true, orderId, sessionId, paymentStatus: orderPaymentStatus, totalAmount, debug, textLog, elapsedMs: Date.now()-start });
     } finally {
       client.release();
     }

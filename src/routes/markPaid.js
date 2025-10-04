@@ -71,12 +71,8 @@ router.post('/', async (req, res) => {
       if (!sid) return res.status(404).json({ success:false, error:'Active session not found for table/qr' });
 
   // Mark all orders in session as paid; keep session ACTIVE so Eat First dashboard shows GREEN
-<<<<<<< HEAD
   // Do NOT reference non-existent columns like paid_at; just flip payment_status.
   await client.query(`UPDATE Orders SET payment_status='paid' WHERE dining_session_id=$1`, [sid]);
-=======
-  await client.query(`UPDATE Orders SET payment_status='paid', paid_at=NOW() WHERE dining_session_id=$1`, [sid]);
->>>>>>> origin/main
 
       console.log('[MARK_PAID_FALLBACK] Marked paid locally for session', sid);
       return res.json({ success:true, sessionId: sid, fallback: true });

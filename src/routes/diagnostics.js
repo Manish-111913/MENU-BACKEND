@@ -78,11 +78,19 @@ router.get('/order-trace', async (req,res) => {
     const client = await pool.connect();
     try {
       if (businessId) await withTenant(client, businessId);
+      // Resolve table names and quote identifiers to handle any casing/underscores
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const ORD = resolve(['Orders','orders','order']);
+      const DS = resolve(['DiningSessions','diningsessions','dining_sessions']);
+      const QR = resolve(['QRCodes','qrcodes','qr_codes']);
       const sql = `SELECT o.order_id, o.dining_session_id, o.status, o.payment_status, o.placed_at,
                           ds.qr_code_id, q.table_number
-                   FROM Orders o
-                   LEFT JOIN DiningSessions ds ON ds.session_id = o.dining_session_id
-                   LEFT JOIN QRCodes q ON q.qr_code_id = ds.qr_code_id
+                   FROM ${qi(ORD)} o
+                   LEFT JOIN ${qi(DS)} ds ON ds.session_id = o.dining_session_id
+                   LEFT JOIN ${qi(QR)} q ON q.qr_code_id = ds.qr_code_id
                    ${businessId? 'WHERE o.business_id = $1':''}
                    ORDER BY o.placed_at DESC LIMIT ${limit}`;
       const params = businessId? [businessId]:[];
@@ -102,8 +110,14 @@ router.get('/session-orders', async (req,res) => {
       if (businessId) await withTenant(client, businessId);
       const exists = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='session_orders' LIMIT 1`);
       if (!exists.rowCount) return res.json({ ok:false, error:'session_orders-missing' });
-      const sql = `SELECT id, session_id, order_status, payment_status, total_amount, created_at FROM session_orders ${businessId? 'WHERE business_id=$1':''} ORDER BY id DESC LIMIT 50`;
-      const params = businessId? [businessId]:[];
+      // Filter by businessId only if the column exists
+      let hasBizCol = false;
+      try {
+        const col = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='session_orders' AND column_name='business_id' LIMIT 1`);
+        hasBizCol = !!col.rowCount;
+      } catch(_){}
+      const sql = `SELECT id, ${hasBizCol? 'business_id, ':''}session_id, order_status, payment_status, total_amount, created_at FROM session_orders ${businessId && hasBizCol? 'WHERE business_id=$1':''} ORDER BY id DESC LIMIT 50`;
+      const params = businessId && hasBizCol? [businessId]:[];
       const { rows } = await client.query(sql, params).catch(e=>({ rows:[], error:e.message }));
       res.json({ ok:true, businessId, count: rows.length, rows });
     } finally { client.release(); }
@@ -121,17 +135,36 @@ router.get('/table-state', async (req, res) => {
     // Collect QR codes & sessions
     let qrCodes = [];
     try {
-      const qr = await client.query(`SELECT qr_code_id, business_id, table_number, current_session_id FROM QRCodes ORDER BY qr_code_id ASC LIMIT 200`);
+      // Resolve table names
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const ORD = resolve(['Orders','orders','order']);
+      const DS = resolve(['DiningSessions','diningsessions','dining_sessions']);
+      const QR = resolve(['QRCodes','qrcodes','qr_codes']);
+
+      const qr = await client.query(`SELECT qr_code_id, business_id, table_number, current_session_id FROM ${qi(QR)} ORDER BY qr_code_id ASC LIMIT 200`);
       qrCodes = qr.rows;
     } catch(e) { debug.push({ step:'qrcodes-error', error:e.message }); }
     let sessions = [];
     try {
-      const ds = await client.query(`SELECT session_id, business_id, qr_code_id, status, created_at FROM DiningSessions ORDER BY session_id DESC LIMIT 200`);
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const DS = resolve(['DiningSessions','diningsessions','dining_sessions']);
+      const ds = await client.query(`SELECT session_id, business_id, qr_code_id, status, created_at FROM ${qi(DS)} ORDER BY session_id DESC LIMIT 200`);
       sessions = ds.rows;
     } catch(e) { debug.push({ step:'sessions-error', error:e.message }); }
     let orders = [];
     try {
-      const ord = await client.query(`SELECT order_id, dining_session_id, payment_status, status, created_at FROM Orders ORDER BY order_id DESC LIMIT 200`);
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const ORD = resolve(['Orders','orders','order']);
+      const ord = await client.query(`SELECT order_id, dining_session_id, payment_status, status, created_at FROM ${qi(ORD)} ORDER BY order_id DESC LIMIT 200`);
       orders = ord.rows;
     } catch(e) { debug.push({ step:'orders-error', error:e.message }); }
 

@@ -131,48 +131,56 @@ router.get('/overview', async (req, res) => {
     const client = await pool.connect();
     try {
       await withTenant(client, businessId);
+      // Resolve table names dynamically and quote as needed
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (...cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const ORD = resolve('Orders','orders','order');
+      const ORDI = resolve('OrderItems','orderitems','order_items');
+      const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+      const QR = resolve('QRCodes','qrcodes','qr_codes');
+
       const { rows } = await client.query(`
         SELECT
           q.qr_code_id,
           q.table_number,
           q.current_session_id AS session_id,
           ds.status AS session_status,
-          -- metrics for logic
           COALESCE( (
-            SELECT COUNT(*) FROM Orders o WHERE o.dining_session_id = ds.session_id
+            SELECT COUNT(*) FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id
           ), 0) AS orders_count,
           EXISTS (
-            SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid'
+            SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid'
           ) AS unpaid_exists,
           EXISTS (
-            SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.status IN ('READY','COMPLETED')
+            SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.status IN ('READY','COMPLETED')
           ) AS any_ready_order,
           EXISTS (
-            SELECT 1 FROM OrderItems oi
-            JOIN Orders o2 ON oi.order_id = o2.order_id
+            SELECT 1 FROM ${qi(ORDI)} oi
+            JOIN ${qi(ORD)} o2 ON oi.order_id = o2.order_id
             WHERE o2.dining_session_id = ds.session_id AND oi.item_status = 'COMPLETED'
           ) AS any_item_completed,
           EXISTS (
-            SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status = 'paid'
+            SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.payment_status = 'paid'
           ) AS any_paid_order,
-          -- first time food is ready (for timer start in pay_first)
           (
             SELECT MIN(ts) FROM (
               SELECT MIN(COALESCE(o.actual_ready_time, o.estimated_ready_time, o.placed_at)) AS ts
-              FROM Orders o
+              FROM ${qi(ORD)} o
               WHERE o.dining_session_id = ds.session_id AND o.status IN ('READY','COMPLETED')
               UNION ALL
               SELECT MIN(oi.updated_at) AS ts
-              FROM OrderItems oi
-              JOIN Orders o2 ON oi.order_id = o2.order_id
+              FROM ${qi(ORDI)} oi
+              JOIN ${qi(ORD)} o2 ON oi.order_id = o2.order_id
               WHERE o2.dining_session_id = ds.session_id AND oi.item_status = 'COMPLETED'
             ) AS t
           ) AS first_ready_at,
           NOT EXISTS (
-            SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid'
+            SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid'
           ) AS all_paid
-        FROM QRCodes q
-        LEFT JOIN DiningSessions ds ON q.current_session_id = ds.session_id
+        FROM ${qi(QR)} q
+        LEFT JOIN ${qi(DS)} ds ON q.current_session_id = ds.session_id
         WHERE q.business_id = $1
         ORDER BY (
           CASE WHEN q.table_number ~ '^\\d+$' THEN q.table_number::int ELSE NULL END
