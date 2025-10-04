@@ -33,6 +33,21 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Startup config logs to make DB/env issues obvious
+{
+  const raw = process.env.DATABASE_URL || process.env.RUNTIME_DATABASE_URL || '';
+  if (!raw) {
+    console.warn('[BOOT] No DATABASE_URL or RUNTIME_DATABASE_URL. DB-backed routes will fail unless ALLOW_DB_MOCK=true');
+  } else {
+    const redacted = raw.replace(/:(?:[^:@/]+)@/, ':***@');
+    const source = process.env.DATABASE_URL ? 'DATABASE_URL' : 'RUNTIME_DATABASE_URL';
+    console.log(`[BOOT] Using ${source} =`, redacted);
+  }
+}
+if (String(process.env.ALLOW_DB_MOCK || '').toLowerCase() === 'true') {
+  console.warn('[BOOT] ALLOW_DB_MOCK is enabled. Endpoints may return mock success without persistence. Disable in production.');
+}
+
 // Global concise logger for troubleshooting 500s on checkout
 app.use(async (req, res, next) => {
   const start = Date.now();

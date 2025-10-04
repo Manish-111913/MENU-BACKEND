@@ -22,8 +22,12 @@ router.post('/', async (req, res) => {
   log('incoming-payload', { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes, flags:{ payFirst, payNow, effectivePayFirst }, itemCount: safeItems.length, totalAmount });
   try {
     if (!pool) {
-      log('pool-missing-mock-env');
-      return res.json({ success: true, orderId: 'mock-1', sessionId: 'mock-session', paymentStatus: effectivePayFirst ? 'paid':'unpaid', amount: totalAmount, debug, textLog });
+      const allowMock = String(process.env.ALLOW_DB_MOCK || '').toLowerCase() === 'true';
+      log('pool-missing', { allowMock });
+      if (allowMock) {
+        return res.json({ success: true, orderId: 'mock-1', sessionId: 'mock-session', paymentStatus: effectivePayFirst ? 'paid':'unpaid', amount: totalAmount, debug, textLog, mock:true });
+      }
+      return res.status(503).json({ error: 'Database not configured. Set DATABASE_URL and redeploy.', debug, textLog });
     }
     const client = await pool.connect();
     try {
@@ -260,7 +264,9 @@ router.post('/', async (req, res) => {
       // Immediate payment semantics
       if (effectivePayFirst && orderPaymentStatus !== 'paid') {
         try {
-          await client.query(`UPDATE Orders SET payment_status='paid' WHERE order_id=$1`, [orderId]);
+          const ordersName = client._resolvedTables?.raw?.orders || 'Orders';
+          const qn = client._resolvedTables? client._resolvedTables.qi(ordersName):'Orders';
+          await client.query(`UPDATE ${qn} SET payment_status='paid' WHERE order_id=$1`, [orderId]);
           orderPaymentStatus='paid'; debug.push({ step:'order-marked-paid' });
           log('order-marked-paid', { orderId });
         } catch(payErr) { debug.push({ step:'mark-paid-error', error: payErr.message, code: payErr.code }); log('mark-paid-error', { message: payErr.message, code: payErr.code }); }

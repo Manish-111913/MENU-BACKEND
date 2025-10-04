@@ -28,12 +28,14 @@ function loadEnv() {
 
 const envLoadInfo = loadEnv();
 
-if (!process.env.DATABASE_URL) {
-  console.warn('DATABASE_URL not set. DB-backed routes will be disabled.', envLoadInfo);
+// Allow fallback to RUNTIME_DATABASE_URL if DATABASE_URL absent
+let effectiveDbUrl = process.env.DATABASE_URL || process.env.RUNTIME_DATABASE_URL || '';
+if (!effectiveDbUrl) {
+  console.warn('DATABASE_URL not set (and no RUNTIME_DATABASE_URL). DB-backed routes will be disabled.', envLoadInfo);
 }
 
-const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+const pool = effectiveDbUrl
+  ? new Pool({ connectionString: effectiveDbUrl, ssl: { rejectUnauthorized: false } })
   : null;
 
 async function withTenant(client, businessId) {

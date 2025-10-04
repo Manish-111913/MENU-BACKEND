@@ -7,6 +7,33 @@ router.get('/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
+// DB state snapshot to debug deployment/env issues
+router.get('/db', async (_req, res) => {
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  const allowMock = String(process.env.ALLOW_DB_MOCK || '').toLowerCase() === 'true';
+  const dbUrl = process.env.DATABASE_URL || '';
+  const redacted = dbUrl ? dbUrl.replace(/:(?:[^:@/]+)@/, ':***@') : null;
+  let serverVersion = null;
+  try {
+    if (pool) {
+      const client = await pool.connect();
+      try {
+        const v = await client.query('SHOW server_version');
+        serverVersion = v.rows?.[0]?.server_version || null;
+      } finally { client.release(); }
+    }
+  } catch(_){}
+  res.json({
+    ok: true,
+    hasPool: !!pool,
+    databaseUrlPresent: !!dbUrl,
+    connection: redacted,
+    nodeEnv,
+    allowMock,
+    serverVersion
+  });
+});
+
 // GET /api/diagnostics/order-pipeline?businessId=1
 // Returns existence of core tables + ability to run trivial SELECTs
 router.get('/order-pipeline', async (req, res) => {
