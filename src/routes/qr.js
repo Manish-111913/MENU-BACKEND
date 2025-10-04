@@ -128,10 +128,18 @@ function attachScanRoute(app) {
   app.get('/qr/:qrId', async (req, res) => {
     try {
       if (!pool) return res.status(500).send('DB unavailable');
-      const businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
-      if (!businessId) return res.status(400).send('businessId required');
+      let businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
       const qrId = Number(req.params.qrId);
       if (!qrId) return res.status(400).send('Invalid qrId');
+      // If businessId not supplied, infer it from the QR code row so scan works out of the box
+      if (!businessId) {
+        try {
+          const tmp = await pool.query('SELECT business_id FROM QRCodes WHERE qr_code_id=$1 LIMIT 1', [qrId]);
+          const inferred = tmp.rows[0]?.business_id ? Number(tmp.rows[0].business_id) : null;
+          if (inferred) businessId = inferred;
+        } catch(_){}
+      }
+      if (!businessId) return res.status(400).send('businessId required');
   const startTs = Date.now();
       console.log(`[QR-SCAN] incoming qrId=${qrId} businessId=${businessId} ip=${req.ip} ua="${(req.get('user-agent')||'').slice(0,120)}"`);
       const client = await pool.connect();
