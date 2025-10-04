@@ -26,5 +26,7 @@ logs/
 .credentials/
 *-service-account*.json
 *-credentials*.json
+.env
 .env.local
 .env.production
+.env.development
