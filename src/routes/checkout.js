@@ -13,11 +13,12 @@ router.post('/', async (req, res) => {
   const textLog = [];
   const log = (msg, extra) => { const line = extra ? { msg, ...extra } : { msg }; debug.push({ step:'log', ...line }); textLog.push(line); };
   const start = Date.now();
-  const { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes = 15, payFirst = false, payNow = false, items = [] } = req.body || {};
+  const { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes = 15, payFirst = false, payNow = false, items = [], totalAmount: totalFromClient } = req.body || {};
   const effectivePayFirst = !!(payFirst || payNow); // accept both flags
   // Compute total amount up front for persistence into Orders/session_orders when possible
   const safeItems = Array.isArray(items) ? items : [];
-  const totalAmount = safeItems.reduce((s,i)=> s + ((Number(i.price)||0) * (Number(i.quantity)||0)), 0);
+  const computed = safeItems.reduce((s,i)=> s + ((Number(i.price)||0) * (Number(i.quantity)||0)), 0);
+  const totalAmount = Number.isFinite(Number(totalFromClient)) && Number(totalFromClient) > 0 ? Number(totalFromClient) : computed;
   debug.push({ step:'version', value:'checkout-v2-dynamic' });
   log('incoming-payload', { businessId, diningSessionId, tableNumber, customerPrepTimeMinutes, flags:{ payFirst, payNow, effectivePayFirst }, itemCount: safeItems.length, totalAmount });
   try {
@@ -243,21 +244,50 @@ router.post('/', async (req, res) => {
         } else { log('session-orders-missing'); }
       } catch (soOuter) { log('session-orders-bridge-check-error', { error: soOuter.message }); }
 
-      // Insert order items (only if menuItemId present) - tolerate failures
+      // Insert order items dynamically: tolerate schema variants and missing menuItemId
       for (const it of safeItems) {
-        if (it && it.menuItemId) {
-          try {
-            const itemsName = client._resolvedTables?.raw?.orderitems || 'OrderItems';
-            await client.query(
-              `INSERT INTO ${client._resolvedTables? client._resolvedTables.qi(itemsName):'OrderItems'} (order_id, menu_item_id, item_status, business_id)
-               VALUES ($1,$2,'QUEUED',$3)`,
-              [orderId, it.menuItemId, tenantId]
-            );
-            log('item-inserted', { menuItemId: it.menuItemId });
-          } catch(itemErr) {
-            debug.push({ step:'item-insert-error', menuItemId: it.menuItemId, error:itemErr.message, code:itemErr.code });
-            log('item-insert-error', { menuItemId: it.menuItemId, error:itemErr.message, code:itemErr.code });
-          }
+        try {
+          const itemsName = client._resolvedTables?.raw?.orderitems || 'OrderItems';
+          const qItems = client._resolvedTables? client._resolvedTables.qi(itemsName):'OrderItems';
+          // Discover available columns
+          const colsRes = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND LOWER(table_name)=LOWER($1)`, [itemsName]);
+          const have = new Set(colsRes.rows.map(r=>String(r.column_name).toLowerCase()));
+          // Ensure helpful columns exist if the table allows changes
+          try { if (!have.has('quantity')) { await client.query(`ALTER TABLE ${qItems} ADD COLUMN quantity INT DEFAULT 1`); have.add('quantity'); } } catch(_e){}
+          try { if (!have.has('unit_price') && !have.has('price')) { await client.query(`ALTER TABLE ${qItems} ADD COLUMN unit_price NUMERIC(12,2) DEFAULT 0`); have.add('unit_price'); } } catch(_e){}
+          try { if (!have.has('item_name') && !have.has('name')) { await client.query(`ALTER TABLE ${qItems} ADD COLUMN item_name TEXT`); have.add('item_name'); } } catch(_e){}
+
+          const qty = Number(it.quantity||1);
+          const price = Number(it.price||0);
+          const name = it.name || null;
+          const menuItemId = it.menuItemId != null ? Number(it.menuItemId) : null;
+
+          // Build dynamic column list and values
+          const cols = [];
+          const vals = [];
+          let idx = 1;
+          const add = (col, val) => { cols.push(col); vals.push(val); return `$${idx++}`; };
+
+          add('order_id', orderId);
+          if (have.has('business_id')) add('business_id', tenantId);
+          if (have.has('item_status')) add('item_status', 'QUEUED');
+          if (menuItemId && have.has('menu_item_id')) add('menu_item_id', menuItemId);
+          if (have.has('quantity')) add('quantity', qty);
+          if (have.has('unit_price')) add('unit_price', price);
+          else if (have.has('price')) add('price', price);
+          if (have.has('item_name')) add('item_name', name);
+          else if (have.has('name')) add('name', name);
+          if (have.has('created_at')) add('created_at', new Date());
+
+          // If only order_id was added (extremely constrained table), skip to avoid invalid SQL
+          if (cols.length <= 1) { log('item-skip-insufficient-columns', { itemsName }); continue; }
+
+          const sql = `INSERT INTO ${qItems} (${cols.map(c=>`"${c}"`).join(',')}) VALUES (${vals.map((_,i)=>`$${i+1}`).join(',')})`;
+          await client.query(sql, vals);
+          log('item-inserted', { menuItemId, qty, price, usedColumns: cols });
+        } catch(itemErr) {
+          debug.push({ step:'item-insert-error', error:itemErr.message, code:itemErr.code });
+          log('item-insert-error', { error:itemErr.message, code:itemErr.code });
         }
       }
 

@@ -16,11 +16,22 @@ function buildFrontendRedirect({ tableNumber, sessionId, qrCodeId, businessId })
   return `${FRONTEND_ORIGIN}/?${params.toString()}`;
 }
 
+async function resolveTables(client) {
+  const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+  const present = t.rows.map(r=>r.table_name);
+  const resolve = (...cands) => { for (const c of cands) { const hit = present.find(p=>p.toLowerCase()===c.toLowerCase()); if (hit) return hit; } return cands[0]; };
+  const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+  return { resolve, qi };
+}
+
 async function ensureActiveSession(client, businessId, qrRow) {
+  const { resolve, qi } = await resolveTables(client);
+  const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+  const QR = resolve('QRCodes','qrcodes','qr_codes');
   const { qr_code_id: qrCodeId, current_session_id } = qrRow;
   if (current_session_id) {
     const existing = await client.query(
-      `SELECT session_id, status FROM DiningSessions WHERE session_id=$1`,
+      `SELECT session_id, status FROM ${qi(DS)} WHERE session_id=$1`,
       [current_session_id]
     );
     if (existing.rows[0] && existing.rows[0].status === 'active') {
@@ -29,11 +40,11 @@ async function ensureActiveSession(client, businessId, qrRow) {
   }
   // Create a new active session
   const ds = await client.query(
-    `INSERT INTO DiningSessions (business_id, qr_code_id, status) VALUES ($1,$2,'active') RETURNING session_id`,
+    `INSERT INTO ${qi(DS)} (business_id, qr_code_id, status) VALUES ($1,$2,'active') RETURNING session_id`,
     [businessId, qrCodeId]
   );
   const sessionId = ds.rows[0].session_id;
-  await client.query(`UPDATE QRCodes SET current_session_id=$1 WHERE qr_code_id=$2`, [sessionId, qrCodeId]);
+  await client.query(`UPDATE ${qi(QR)} SET current_session_id=$1 WHERE qr_code_id=$2`, [sessionId, qrCodeId]);
   return { created: true, sessionId, qrCodeId };
 }
 
@@ -57,8 +68,10 @@ router.get('/scan-urls', async (req, res) => {
     const client = await pool.connect();
     try {
       await withTenant(client, businessId);
+      const { resolve, qi } = await resolveTables(client);
+      const QR = resolve('QRCodes','qrcodes','qr_codes');
       const { rows } = await client.query(
-        `SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE business_id=$1 ORDER BY table_number ASC`,
+        `SELECT qr_code_id, table_number, current_session_id FROM ${qi(QR)} WHERE business_id=$1 ORDER BY table_number ASC`,
         [businessId]
       );
       const list = rows.map(r => ({
@@ -88,7 +101,7 @@ router.get('/scan-urls', async (req, res) => {
 router.post('/ensure-session', async (req, res) => {
   try {
     if (!pool) return res.status(500).json({ error: 'Database not configured' });
-    const { businessId: rawBiz, qrCodeId, tableNumber } = req.body || {};
+  const { businessId: rawBiz, qrCodeId, tableNumber } = req.body || {};
     const businessId = Number(rawBiz) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
     if (!businessId) return res.status(400).json({ error: 'businessId required' });
     if (!qrCodeId && !tableNumber) return res.status(400).json({ error: 'qrCodeId or tableNumber required' });
@@ -96,15 +109,17 @@ router.post('/ensure-session', async (req, res) => {
     try {
       await withTenant(client, businessId);
       let qrRow;
+      const { resolve, qi } = await resolveTables(client);
+      const QR = resolve('QRCodes','qrcodes','qr_codes');
       if (qrCodeId) {
-        const qr = await client.query(`SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE qr_code_id=$1 AND business_id=$2`, [qrCodeId, businessId]);
+        const qr = await client.query(`SELECT qr_code_id, table_number, current_session_id FROM ${qi(QR)} WHERE qr_code_id=$1 AND business_id=$2`, [qrCodeId, businessId]);
         if (!qr.rowCount) return res.status(404).json({ error: 'QR code not found' });
         qrRow = qr.rows[0];
       } else {
         // ensure by table number without requiring a unique constraint
         const tbl = String(tableNumber).trim();
         let sel = await client.query(
-          `SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
+          `SELECT qr_code_id, table_number, current_session_id FROM ${qi(QR)} WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
           [businessId, tbl]
         );
         if (sel.rowCount) {
@@ -112,7 +127,7 @@ router.post('/ensure-session', async (req, res) => {
         } else {
           try {
             const ins = await client.query(
-              `INSERT INTO QRCodes (business_id, table_number) VALUES ($1,$2)
+              `INSERT INTO ${qi(QR)} (business_id, table_number) VALUES ($1,$2)
                RETURNING qr_code_id, table_number, current_session_id`,
               [businessId, tbl]
             );
@@ -121,7 +136,7 @@ router.post('/ensure-session', async (req, res) => {
             // Handle potential duplicate insert races without unique constraint
             if (insErr && insErr.code === '23505') {
               const again = await client.query(
-                `SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
+                `SELECT qr_code_id, table_number, current_session_id FROM ${qi(QR)} WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
                 [businessId, tbl]
               );
               if (again.rowCount) qrRow = again.rows[0];
@@ -134,7 +149,7 @@ router.post('/ensure-session', async (req, res) => {
       const result = await ensureActiveSession(client, businessId, qrRow);
       // Try optional last_scan_at update if column exists
       try {
-        await client.query('UPDATE QRCodes SET last_scan_at=NOW() WHERE qr_code_id=$1', [qrRow.qr_code_id]);
+        await client.query(`UPDATE ${qi(QR)} SET last_scan_at=NOW() WHERE qr_code_id=$1`, [qrRow.qr_code_id]);
       } catch (_) { /* column may not exist */ }
       res.json({ ...result, tableNumber: qrRow.table_number, businessId });
     } finally { client.release(); }
@@ -155,7 +170,9 @@ function attachScanRoute(app) {
       // If businessId not supplied, infer it from the QR code row so scan works out of the box
       if (!businessId) {
         try {
-          const tmp = await pool.query('SELECT business_id FROM QRCodes WHERE qr_code_id=$1 LIMIT 1', [qrId]);
+          const { resolve, qi } = await resolveTables(pool);
+          const QR = resolve('QRCodes','qrcodes','qr_codes');
+          const tmp = await pool.query(`SELECT business_id FROM ${qi(QR)} WHERE qr_code_id=$1 LIMIT 1`, [qrId]);
           const inferred = tmp.rows[0]?.business_id ? Number(tmp.rows[0].business_id) : null;
           if (inferred) businessId = inferred;
         } catch(_){}
@@ -166,32 +183,40 @@ function attachScanRoute(app) {
       const client = await pool.connect();
       try {
         await withTenant(client, businessId);
+        const { resolve, qi } = await resolveTables(client);
+        const QR = resolve('QRCodes','qrcodes','qr_codes');
+        const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+        const ORD = resolve('Orders','orders','order');
         const qr = await client.query(
-          `SELECT qr_code_id, table_number, current_session_id FROM QRCodes WHERE qr_code_id=$1 AND business_id=$2`,
+          `SELECT qr_code_id, table_number, current_session_id FROM ${qi(QR)} WHERE qr_code_id=$1 AND business_id=$2`,
           [qrId, businessId]
         );
         if (!qr.rowCount) return res.status(404).send('QR not found');
         const qrRow = qr.rows[0];
         const sessionInfo = await ensureActiveSession(client, businessId, qrRow);
         // Opportunistic last_scan_at
-        try { await client.query('UPDATE QRCodes SET last_scan_at=NOW() WHERE qr_code_id=$1', [qrRow.qr_code_id]); } catch (_) {}
+        try { await client.query(`UPDATE ${qi(QR)} SET last_scan_at=NOW() WHERE qr_code_id=$1`, [qrRow.qr_code_id]); } catch (_) {}
 
         // Pull metrics for this session to log predicted colors for both modes
         let metrics = null;
         try {
+          const { resolve, qi } = await resolveTables(client);
+          const ORD = resolve('Orders','orders','order');
+          const ORDI = resolve('OrderItems','orderitems','order_items');
+          const DS = resolve('DiningSessions','diningsessions','dining_sessions');
           const m = await client.query(`
             SELECT
               ds.session_id,
               ds.status AS session_status,
-              COALESCE((SELECT COUNT(*) FROM Orders o WHERE o.dining_session_id = ds.session_id),0) AS orders_count,
-              EXISTS (SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid') AS unpaid_exists,
-              EXISTS (SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.status IN ('READY','COMPLETED')) AS any_ready_order,
+              COALESCE((SELECT COUNT(*) FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id),0) AS orders_count,
+              EXISTS (SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid') AS unpaid_exists,
+              EXISTS (SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.status IN ('READY','COMPLETED')) AS any_ready_order,
               EXISTS (
-                SELECT 1 FROM OrderItems oi JOIN Orders o2 ON oi.order_id = o2.order_id
+                SELECT 1 FROM ${qi(ORDI)} oi JOIN ${qi(ORD)} o2 ON oi.order_id = o2.order_id
                 WHERE o2.dining_session_id = ds.session_id AND oi.item_status = 'COMPLETED'
               ) AS any_item_completed,
-              NOT EXISTS (SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid') AS all_paid
-            FROM DiningSessions ds
+              NOT EXISTS (SELECT 1 FROM ${qi(ORD)} o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid') AS all_paid
+            FROM ${qi(DS)} ds
             WHERE ds.session_id=$1
             LIMIT 1`, [sessionInfo.sessionId]);
           metrics = m.rows[0];

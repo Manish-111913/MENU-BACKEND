@@ -75,9 +75,15 @@ router.post('/', async (req, res) => {
   try {
     const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
     const present = t.rows.map(r=>r.table_name);
-    const resolve = (cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const resolve = (...cands) => {
+        for (const c of cands) {
+          const hit = present.find(p => p.toLowerCase()===c.toLowerCase());
+          if (hit) return hit;
+        }
+        return cands[0];
+      };
     const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
-    const ORD = resolve(['Orders','orders','order']);
+      const ORD = resolve('Orders','orders','order');
     await client.query(`UPDATE ${qi(ORD)} SET payment_status='paid' WHERE dining_session_id=$1`, [sid]);
   } catch (updErr) {
     console.error('[MARK_PAID_FALLBACK] update error', updErr.message);

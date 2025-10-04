@@ -2,6 +2,14 @@ const express = require('express');
 const router = express.Router();
 const { pool, withTenant } = require('../db');
 
+async function resolveTables(client) {
+  const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+  const present = t.rows.map(r=>r.table_name);
+  const resolve = (...cands) => { for (const c of cands) { const hit = present.find(p=>p.toLowerCase()===c.toLowerCase()); if (hit) return hit; } return cands[0]; };
+  const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+  return { resolve, qi };
+}
+
 // GET /api/orders?businessId=&sessionId=&limit=50
 // Returns enriched orders with table_number and color status (ash/unpaid -> yellow/active -> green/paid)
 router.get('/', async (req, res) => {
@@ -14,15 +22,19 @@ router.get('/', async (req, res) => {
     const limit = Math.min(Number(req.query.limit)||50, 200);
     const client = await pool.connect();
     try {
-      await withTenant(client, businessId);
-      // join to DiningSessions and QRCodes when present
-      const params = [];
-      let sql = `SELECT o.order_id, o.status, o.placed_at, o.estimated_ready_time, o.actual_ready_time, o.payment_status,
-                        o.dining_session_id, ds.qr_code_id, q.table_number
-                   FROM Orders o
-                   LEFT JOIN DiningSessions ds ON ds.session_id = o.dining_session_id
-                   LEFT JOIN QRCodes q ON q.qr_code_id = ds.qr_code_id
-                   WHERE 1=1`;
+   await withTenant(client, businessId);
+   const { resolve, qi } = await resolveTables(client);
+   const ORD = resolve('Orders','orders','order');
+   const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+   const QR = resolve('QRCodes','qrcodes','qr_codes');
+   // join to DiningSessions and QRCodes when present
+   const params = [];
+   let sql = `SELECT o.order_id, o.status, o.placed_at, o.estimated_ready_time, o.actual_ready_time, o.payment_status,
+            o.dining_session_id, ds.qr_code_id, q.table_number
+          FROM ${qi(ORD)} o
+          LEFT JOIN ${qi(DS)} ds ON ds.session_id = o.dining_session_id
+          LEFT JOIN ${qi(QR)} q ON q.qr_code_id = ds.qr_code_id
+          WHERE 1=1`;
       if (businessId) { params.push(businessId); sql += ` AND o.business_id = $${params.length}`; }
       if (sessionId)  { params.push(sessionId);  sql += ` AND o.dining_session_id = $${params.length}`; }
       sql += ` ORDER BY o.placed_at DESC LIMIT ${limit}`;
@@ -84,13 +96,18 @@ router.post('/', async (req, res) => {
 
     const client = await pool.connect();
     try {
-      await withTenant(client, businessId);
+  await withTenant(client, businessId);
+  const { resolve, qi } = await resolveTables(client);
+  const ORD = resolve('Orders','orders','order');
+  const ORDI = resolve('OrderItems','orderitems','order_items');
+  const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+  const QR = resolve('QRCodes','qrcodes','qr_codes');
       await client.query('BEGIN');
       debug.push({ step: 'tx-begin' });
 
       // Find QR code for the table
       const qrRes = await client.query(
-        `SELECT qr_code_id, current_session_id FROM QRCodes WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
+        `SELECT qr_code_id, current_session_id FROM ${qi(QR)} WHERE business_id=$1 AND table_number=$2 LIMIT 1`,
         [businessId, tableNumber]
       );
       if (!qrRes.rowCount) {
@@ -104,7 +121,7 @@ router.post('/', async (req, res) => {
       let sessionPaymentStatus = 'unpaid';
 
       if (sessionId) {
-        const sessRes = await client.query(`SELECT session_id, payment_status FROM DiningSessions WHERE session_id=$1 LIMIT 1`, [sessionId]);
+        const sessRes = await client.query(`SELECT session_id, payment_status FROM ${qi(DS)} WHERE session_id=$1 LIMIT 1`, [sessionId]);
         if (sessRes.rowCount) {
           sessionPaymentStatus = (sessRes.rows[0].payment_status || 'unpaid').trim().toLowerCase();
           debug.push({ step: 'reuse-session', session_id: sessionId, payment_status: sessionPaymentStatus });
@@ -117,19 +134,19 @@ router.post('/', async (req, res) => {
 
       if (!sessionId) {
         const dsIns = await client.query(
-          `INSERT INTO DiningSessions (qr_code_id, business_id, started_at, status, payment_status) VALUES ($1,$2,NOW(),'active','unpaid') RETURNING session_id, payment_status`,
+          `INSERT INTO ${qi(DS)} (qr_code_id, business_id, started_at, status, payment_status) VALUES ($1,$2,NOW(),'active','unpaid') RETURNING session_id, payment_status`,
           [qr.qr_code_id, businessId]
         );
         sessionId = dsIns.rows[0].session_id;
         sessionPaymentStatus = (dsIns.rows[0].payment_status || 'unpaid').trim().toLowerCase();
         debug.push({ step: 'session-created', session_id: sessionId });
-        await client.query(`UPDATE QRCodes SET current_session_id=$1 WHERE qr_code_id=$2`, [sessionId, qr.qr_code_id]);
+  await client.query(`UPDATE ${qi(QR)} SET current_session_id=$1 WHERE qr_code_id=$2`, [sessionId, qr.qr_code_id]);
         debug.push({ step: 'qr-updated-with-session' });
       }
 
       // If payNow requested, pre-mark session paid (even before order insert) to support green with zero orders edge case.
       if (payNow && sessionPaymentStatus !== 'paid') {
-        await client.query(`UPDATE DiningSessions SET payment_status='paid' WHERE session_id=$1`, [sessionId]);
+        await client.query(`UPDATE ${qi(DS)} SET payment_status='paid' WHERE session_id=$1`, [sessionId]);
         sessionPaymentStatus = 'paid';
         debug.push({ step: 'session-marked-paid' });
       }
@@ -137,7 +154,7 @@ router.post('/', async (req, res) => {
       // Insert order (always create an order so counts reflect activity, unless explicitly skip when no items & already paid? We'll always insert for clarity)
       const orderPaymentStatus = payNow ? 'paid' : 'unpaid';
       const ordIns = await client.query(
-        `INSERT INTO Orders (business_id, dining_session_id, status, placed_at, payment_status, total_amount)
+        `INSERT INTO ${qi(ORD)} (business_id, dining_session_id, status, placed_at, payment_status, total_amount)
          VALUES ($1,$2,'PLACED',NOW(),$3,COALESCE($4,0)) RETURNING order_id, payment_status, status, placed_at`,
         [businessId, sessionId, orderPaymentStatus, derivedTotal]
       );
@@ -146,16 +163,25 @@ router.post('/', async (req, res) => {
 
       // Optionally insert items if OrderItems table exists and items array not empty
       if (Array.isArray(items) && items.length) {
-        const existsItems = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='orderitems' LIMIT 1`);
+        const existsItems = await client.query(`SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=LOWER($1) LIMIT 1`, [ORDI]);
         if (existsItems.rowCount) {
           for (const it of items) {
             const name = (it.name || it.itemName || '').toString();
             const qty = Number(it.quantity || it.qty || 1);
             const price = Number(it.price || it.unitPrice || 0);
+            // Try to use common columns dynamically
             await client.query(
-              `INSERT INTO OrderItems (order_id, item_name, quantity, price, created_at) VALUES ($1,$2,$3,$4,NOW())`,
+              `INSERT INTO ${qi(ORDI)} (order_id, item_name, quantity, unit_price, created_at) VALUES ($1,$2,$3,$4,NOW())`,
               [order.order_id, name, qty, price]
-            );
+            ).catch(async () => {
+              // Fallback to (order_id, name, quantity, price)
+              try {
+                await client.query(
+                  `INSERT INTO ${qi(ORDI)} (order_id, name, quantity, price, created_at) VALUES ($1,$2,$3,$4,NOW())`,
+                  [order.order_id, name, qty, price]
+                );
+              } catch(_e){}
+            });
           }
           debug.push({ step: 'items-inserted', count: items.length });
         } else {
@@ -275,10 +301,14 @@ router.get('/by-table', async (req, res) => {
       await withTenant(client, businessId);
 
       // Pull each QR code + its current active session (if any)
+      const { resolve: resolve2, qi: qi2 } = await resolveTables(client);
+      const ORD2 = resolve2('Orders','orders','order');
+      const DS2 = resolve2('DiningSessions','diningsessions','dining_sessions');
+      const QR2 = resolve2('QRCodes','qrcodes','qr_codes');
       const baseRows = await client.query(`
         SELECT q.qr_code_id, q.table_number, ds.session_id, ds.payment_status AS session_payment_status
-          FROM QRCodes q
-          LEFT JOIN DiningSessions ds ON ds.session_id = q.current_session_id
+          FROM ${qi2(QR2)} q
+          LEFT JOIN ${qi2(DS2)} ds ON ds.session_id = q.current_session_id
          WHERE q.business_id = $1
          ORDER BY (
            CASE WHEN q.table_number ~ '^\\d+$' THEN LPAD(q.table_number, 10, '0') ELSE q.table_number END
@@ -295,14 +325,14 @@ router.get('/by-table', async (req, res) => {
                  COUNT(*) FILTER (WHERE COALESCE(o.payment_status,'unpaid') <> 'paid') AS unpaid_count,
                  COUNT(*) FILTER (WHERE COALESCE(o.payment_status,'unpaid') = 'paid') AS paid_count,
                  BOOL_AND(COALESCE(o.payment_status,'unpaid') = 'paid') AS all_paid
-            FROM Orders o
+            FROM ${qi2(ORD2)} o
            WHERE o.dining_session_id = ANY($1::bigint[])
            GROUP BY o.dining_session_id`, [sessionIds]);
         ordersAgg = new Map(aggRows.map(r => [r.session_id, r]));
         if (debugMode) {
           const { rows: statusRows } = await client.query(`
             SELECT o.dining_session_id AS session_id, o.payment_status
-              FROM Orders o
+              FROM ${qi2(ORD2)} o
              WHERE o.dining_session_id = ANY($1::bigint[])`, [sessionIds]);
           for (const r of statusRows) {
             if (!orderStatusesBySession.has(r.session_id)) orderStatusesBySession.set(r.session_id, []);
@@ -368,16 +398,20 @@ router.get('/debug-latest', async (req,res)=>{
     try {
       await withTenant(client, businessId);
       // Detect if total_amount column exists in Orders; some schemas may not yet have it.
-      const colCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='total_amount' LIMIT 1`);
+   const { resolve: resolve3, qi: qi3 } = await resolveTables(client);
+   const ORD3 = resolve3('Orders','orders','order');
+   const DS3 = resolve3('DiningSessions','diningsessions','dining_sessions');
+   const QR3 = resolve3('QRCodes','qrcodes','qr_codes');
+   const colCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name=LOWER($1) AND column_name='total_amount' LIMIT 1`, [ORD3]);
       const totalExpr = colCheck.rowCount ? 'o.total_amount' : '0::numeric AS total_amount';
-      // Detect if DiningSessions has payment_status column (older schemas may not).
-      const dsPayCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name='diningsessions' AND column_name='payment_status' LIMIT 1`);
+   // Detect if DiningSessions has payment_status column (older schemas may not).
+   const dsPayCheck = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_name=LOWER($1) AND column_name='payment_status' LIMIT 1`, [DS3]);
       const sessionPayExpr = dsPayCheck.rowCount ? 'ds.payment_status AS session_payment_status' : 'NULL::text AS session_payment_status';
-      const sql = `SELECT o.order_id, o.dining_session_id, o.status, o.payment_status, ${totalExpr}, o.placed_at,
-                          ${sessionPayExpr}, q.table_number
-                     FROM Orders o
-                     LEFT JOIN DiningSessions ds ON ds.session_id = o.dining_session_id
-                     LEFT JOIN QRCodes q ON q.qr_code_id = ds.qr_code_id
+   const sql = `SELECT o.order_id, o.dining_session_id, o.status, o.payment_status, ${totalExpr}, o.placed_at,
+           ${sessionPayExpr}, q.table_number
+         FROM ${qi3(ORD3)} o
+         LEFT JOIN ${qi3(DS3)} ds ON ds.session_id = o.dining_session_id
+         LEFT JOIN ${qi3(QR3)} q ON q.qr_code_id = ds.qr_code_id
                     WHERE o.business_id = $1
                     ORDER BY o.placed_at DESC
                     LIMIT ${limit}`;

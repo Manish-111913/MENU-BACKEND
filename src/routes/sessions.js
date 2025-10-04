@@ -134,7 +134,13 @@ router.get('/overview', async (req, res) => {
       // Resolve table names dynamically and quote as needed
       const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
       const present = t.rows.map(r=>r.table_name);
-      const resolve = (...cands) => cands.find(c => present.some(p=>p.toLowerCase()===c.toLowerCase())) || cands[0];
+      const resolve = (...cands) => {
+        for (const c of cands) {
+          const hit = present.find(p => p.toLowerCase() === c.toLowerCase());
+          if (hit) return hit;
+        }
+        return cands[0];
+      };
       const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
       const ORD = resolve('Orders','orders','order');
       const ORDI = resolve('OrderItems','orderitems','order_items');
@@ -243,10 +249,18 @@ router.get('/table', async (req, res) => {
     const client = await pool.connect();
     try {
       await withTenant(client, businessId);
+      // Resolve table names dynamically to avoid case/casing issues
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (...cands) => { for (const c of cands) { const hit = present.find(p=>p.toLowerCase()===c.toLowerCase()); if (hit) return hit; } return cands[0]; };
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const ORD = resolve('Orders','orders','order');
+      const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+      const QR = resolve('QRCodes','qrcodes','qr_codes');
       const qr = await client.query(`
         SELECT q.qr_code_id, q.table_number, q.current_session_id, ds.status AS session_status, ds.start_time, ds.end_time
-        FROM QRCodes q
-        LEFT JOIN DiningSessions ds ON q.current_session_id = ds.session_id
+        FROM ${qi(QR)} q
+        LEFT JOIN ${qi(DS)} ds ON q.current_session_id = ds.session_id
         WHERE q.business_id=$1 AND q.table_number=$2
         LIMIT 1`, [businessId, tableNumber]);
       if (!qr.rowCount) return res.json({ exists:false, message:'No QR code row yet for this table.' });
@@ -255,7 +269,7 @@ router.get('/table', async (req, res) => {
       if (row.current_session_id) {
         const ord = await client.query(`
           SELECT order_id, status, payment_status, placed_at, estimated_ready_time
-          FROM Orders
+          FROM ${qi(ORD)}
           WHERE dining_session_id=$1
           ORDER BY placed_at DESC LIMIT 25`, [row.current_session_id]);
         orders = ord.rows;
@@ -265,6 +279,69 @@ router.get('/table', async (req, res) => {
   } catch (err) {
     console.error('GET /api/sessions/table error:', err);
     res.status(500).json({ error: 'Failed to inspect table' });
+  }
+});
+
+// GET /api/sessions/details?businessId=&tableNumber=
+// Returns rich details for a table: session, orders, items, amount summary.
+router.get('/details', async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: 'Database not configured' });
+    const businessId = Number(req.query.businessId) || Number(process.env.DEFAULT_BUSINESS_ID) || null;
+    const tableNumber = req.query.tableNumber ? String(req.query.tableNumber).trim() : null;
+    if (!businessId || !tableNumber) return res.status(400).json({ error: 'businessId and tableNumber required' });
+    const client = await pool.connect();
+    try {
+      await withTenant(client, businessId);
+      // Resolve tables and quote
+      const t = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`);
+      const present = t.rows.map(r=>r.table_name);
+      const resolve = (...c) => {
+        for (const n of c) {
+          const hit = present.find(p=>p.toLowerCase()===n.toLowerCase());
+          if (hit) return hit;
+        }
+        return c[0];
+      };
+      const qi = (n) => (/[^a-z0-9_]/.test(n) || /[A-Z]/.test(n)) ? '"'+n.replace(/"/g,'""')+'"' : n;
+      const ORD = resolve('Orders','orders');
+      const ORDI = resolve('OrderItems','orderitems','order_items');
+      const DS = resolve('DiningSessions','diningsessions','dining_sessions');
+      const QR = resolve('QRCodes','qrcodes','qr_codes');
+
+      const qr = await client.query(`
+        SELECT q.qr_code_id, q.table_number, q.current_session_id, ds.status AS session_status
+        FROM ${qi(QR)} q
+        LEFT JOIN ${qi(DS)} ds ON ds.session_id = q.current_session_id
+        WHERE q.business_id=$1 AND q.table_number=$2
+        LIMIT 1`, [businessId, tableNumber]);
+      if (!qr.rowCount) return res.json({ exists:false, message:'No QR code row yet for this table.' });
+      const row = qr.rows[0];
+      if (!row.current_session_id) return res.json({ exists:true, session:false, table: row.table_number, orders:[], items:[], totals:{ paid:0, unpaid:0, all:0 } });
+      const sid = row.current_session_id;
+
+      const orders = await client.query(`
+        SELECT order_id, status, payment_status, total_amount
+        FROM ${qi(ORD)} WHERE dining_session_id=$1 ORDER BY placed_at ASC`, [sid]);
+      const items = await client.query(`
+        SELECT oi.order_id, oi.menu_item_id, oi.item_status, oi.quantity, oi.unit_price, oi.item_name
+        FROM ${qi(ORDI)} oi
+        JOIN ${qi(ORD)} o ON o.order_id = oi.order_id
+        WHERE o.dining_session_id=$1
+        ORDER BY oi.order_id ASC`, [sid]);
+
+      // Amounts
+      let paid=0, unpaid=0;
+      for (const o of orders.rows) {
+        const amt = Number(o.total_amount||0);
+        if (o.payment_status === 'paid') paid += amt; else unpaid += amt;
+      }
+      const totals = { paid, unpaid, all: paid + unpaid };
+      res.json({ exists:true, session:true, table: row.table_number, sessionId: sid, sessionStatus: row.session_status, orders: orders.rows, items: items.rows, totals });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('GET /api/sessions/details error:', err);
+    res.status(500).json({ error: 'Failed to load table details' });
   }
 });
 
