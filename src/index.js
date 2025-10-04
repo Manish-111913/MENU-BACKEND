@@ -7,7 +7,6 @@ const app = express();
 // Config
 const PORT = process.env.PORT || 5500;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:3300';
-const FRONTEND_MENU_ORIGIN = process.env.FRONTEND_MENU_ORIGIN || process.env.PUBLIC_MENU_BASE_URL;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 // Middleware
@@ -19,24 +18,16 @@ const additionalOrigins = process.env.ADDITIONAL_ORIGINS
 
 const allowedOrigins = [
   FRONTEND_ORIGIN,
-  FRONTEND_MENU_ORIGIN,
   ...additionalOrigins,
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'http://localhost:3300',
   'http://127.0.0.1:3300',
   'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  // Known deployed menu origin
-  'https://menu-frontend-9327c.web.app'
+  'http://127.0.0.1:5173'
 ].filter(Boolean);
 
 app.use(cors({
-  origin: IS_PROD ? allowedOrigins : true,
-  credentials: true
-}));
-// Ensure preflight (OPTIONS) requests get CORS headers in all routes
-app.options('*', cors({
   origin: IS_PROD ? allowedOrigins : true,
   credentials: true
 }));
@@ -64,6 +55,8 @@ app.use((req, res, next) => {
 
 // Health
 app.get('/health', (_, res) => res.json({ ok: true }));
+// Alias for clients probing /api/health
+app.get('/api/health', (_, res) => res.json({ ok: true }));
 
 // Routes
 app.use('/api/menu', require('./routes/menu'));

@@ -155,6 +155,19 @@ router.get('/overview', async (req, res) => {
           EXISTS (
             SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status = 'paid'
           ) AS any_paid_order,
+          -- first time food is ready (for timer start in pay_first)
+          (
+            SELECT MIN(ts) FROM (
+              SELECT MIN(COALESCE(o.actual_ready_time, o.estimated_ready_time, o.placed_at)) AS ts
+              FROM Orders o
+              WHERE o.dining_session_id = ds.session_id AND o.status IN ('READY','COMPLETED')
+              UNION ALL
+              SELECT MIN(oi.updated_at) AS ts
+              FROM OrderItems oi
+              JOIN Orders o2 ON oi.order_id = o2.order_id
+              WHERE o2.dining_session_id = ds.session_id AND oi.item_status = 'COMPLETED'
+            ) AS t
+          ) AS first_ready_at,
           NOT EXISTS (
             SELECT 1 FROM Orders o WHERE o.dining_session_id = ds.session_id AND o.payment_status <> 'paid'
           ) AS all_paid
@@ -173,15 +186,15 @@ router.get('/overview', async (req, res) => {
         const anyReadyDish = r.any_ready_order || r.any_item_completed; // fallback if order.status not updated
         if (mode === 'pay_first') {
           if (hasActive) {
-            if (anyReadyDish) { color = 'green'; reason = 'first dish ready / item completed'; }
-            else if (r.all_paid && r.orders_count > 0) { color = 'yellow'; reason = 'all orders paid, waiting first dish'; }
-            else { color = 'ash'; reason = 'no paid order yet or none ready'; }
+            if (anyReadyDish) { color = 'green'; reason = 'customer eating (first dish ready)'; }
+            else if (r.any_paid_order) { color = 'yellow'; reason = 'occupied & paid; preparing food'; }
+            else { color = 'ash'; reason = 'no payment yet'; }
           }
         } else { // eat_later
           if (hasActive) {
-            if (r.unpaid_exists) { color = 'yellow'; reason = 'unpaid orders exist'; }
-            else if (r.orders_count > 0 && r.all_paid) { color = 'green'; reason = 'all orders paid'; }
-            else { color = 'ash'; reason = 'active session, no orders yet'; }
+            // Yellow from session start until payment completes
+            if (r.all_paid && r.orders_count > 0) { color = 'green'; reason = 'payment completed'; }
+            else { color = 'yellow'; reason = r.orders_count > 0 ? 'ordering/eating in progress' : 'session active'; }
           }
         }
         return {
@@ -194,6 +207,8 @@ router.get('/overview', async (req, res) => {
           any_ready_order: r.any_ready_order,
           any_item_completed: r.any_item_completed,
           all_paid: r.all_paid,
+          any_paid_order: r.any_paid_order,
+          first_ready_at: r.first_ready_at,
           mode_applied: mode,
           color,
           reason
